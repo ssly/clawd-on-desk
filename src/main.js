@@ -2,6 +2,8 @@ const { app, BrowserWindow, screen, Menu, ipcMain, globalShortcut } = require("e
 const path = require("path");
 const fs = require("fs");
 const { applyStationaryCollectionBehavior } = require("./mac-window");
+const hitGeometry = require("./hit-geometry");
+const { findNearestWorkArea, computeLooseClamp, SYNTHETIC_WORK_AREA } = require("./work-area");
 
 // ── Autoplay policy: allow sound playback without user gesture ──
 // MUST be set before any BrowserWindow is created (before app.whenReady)
@@ -33,40 +35,119 @@ const SIZES = {
   L: { width: 360, height: 360 },
 };
 
-let lang = "en";
-
-// ── Position persistence ──
+// ── Settings (prefs.js + settings-controller.js) ──
+//
+// `prefs.js` handles disk I/O + schema validation + migrations.
+// `settings-controller.js` is the single writer of the in-memory snapshot.
+// Module-level `lang`/`showTray`/etc. below are mirror caches kept in sync via
+// a subscriber wired after menu.js loads. The ctx setters route writes through
+// `_settingsController.applyUpdate()`, which auto-persists.
+const prefsModule = require("./prefs");
+const { createSettingsController } = require("./settings-controller");
+const loginItemHelpers = require("./login-item");
 const PREFS_PATH = path.join(app.getPath("userData"), "clawd-prefs.json");
+const _initialPrefsLoad = prefsModule.load(PREFS_PATH);
 
-function loadPrefs() {
+// Lazy helpers — these run inside the action `effect` callbacks at click time,
+// long after server.js / hooks/install.js are loaded. Wrapping them in closures
+// avoids a chicken-and-egg require order at module load.
+function _installAutoStartHook() {
+  const { registerHooks } = require("../hooks/install.js");
+  registerHooks({ silent: true, autoStart: true, port: getHookServerPort() });
+}
+function _uninstallAutoStartHook() {
+  const { unregisterAutoStart } = require("../hooks/install.js");
+  unregisterAutoStart();
+}
+
+// Cross-platform "open at login" writer used by both the openAtLogin effect
+// and the startup hydration helper. Throws on failure so the action layer can
+// surface the error to the UI.
+function _writeSystemOpenAtLogin(enabled) {
+  if (isLinux) {
+    const launchScript = path.join(__dirname, "..", "launch.js");
+    const execCmd = app.isPackaged
+      ? `"${process.env.APPIMAGE || app.getPath("exe")}"`
+      : `node "${launchScript}"`;
+    loginItemHelpers.linuxSetOpenAtLogin(enabled, { execCmd });
+    return;
+  }
+  app.setLoginItemSettings(
+    loginItemHelpers.getLoginItemSettings({
+      isPackaged: app.isPackaged,
+      openAtLogin: enabled,
+      execPath: process.execPath,
+      appPath: app.getAppPath(),
+    })
+  );
+}
+function _readSystemOpenAtLogin() {
+  if (isLinux) return loginItemHelpers.linuxGetOpenAtLogin();
+  return app.getLoginItemSettings(
+    app.isPackaged ? {} : { path: process.execPath, args: [app.getAppPath()] }
+  ).openAtLogin;
+}
+
+const _settingsController = createSettingsController({
+  prefsPath: PREFS_PATH,
+  loadResult: _initialPrefsLoad,
+  injectedDeps: {
+    installAutoStart: _installAutoStartHook,
+    uninstallAutoStart: _uninstallAutoStartHook,
+    setOpenAtLogin: _writeSystemOpenAtLogin,
+  },
+});
+
+// Mirror of `_settingsController.get("lang")` so existing sync read sites in
+// menu.js / state.js / etc. don't have to round-trip through the controller.
+// Updated by the subscriber in `wireSettingsSubscribers()` below — never
+// assign directly.
+let lang = _settingsController.get("lang");
+
+// First-run import of system-backed settings into prefs. The actual truth for
+// `openAtLogin` lives in OS login items / autostart files; if we just trusted
+// the schema default (false), an upgrading user with login-startup already
+// enabled would silently lose it the first time prefs is saved. So on first
+// boot after this field exists in the schema, copy the system value INTO prefs
+// and mark it hydrated. After that, prefs is the source of truth and the
+// openAtLogin pre-commit gate handles future writes back to the system.
+//
+// MUST run inside app.whenReady() — Electron's app.getLoginItemSettings() is
+// only stable after the app is ready. MUST run before createWindow() so the
+// first menu render reads the hydrated value.
+function hydrateSystemBackedSettings() {
+  if (_settingsController.get("openAtLoginHydrated")) return;
+  let systemValue = false;
   try {
-    const raw = JSON.parse(fs.readFileSync(PREFS_PATH, "utf8"));
-    if (!raw || typeof raw !== "object") return null;
-    // Validate miniEdge allowlist
-    if (raw.miniEdge !== "left" && raw.miniEdge !== "right") raw.miniEdge = "right";
-    // Sanitize numeric fields — corrupted JSON can feed NaN into window positioning
-    for (const key of ["x", "y", "preMiniX", "preMiniY"]) {
-      if (key in raw && (typeof raw[key] !== "number" || !isFinite(raw[key]))) {
-        raw[key] = 0;
-      }
-    }
-    return raw;
-  } catch {
-    return null;
+    systemValue = !!_readSystemOpenAtLogin();
+  } catch (err) {
+    console.warn("Clawd: failed to read system openAtLogin during hydration:", err && err.message);
+  }
+  const result = _settingsController.hydrate({
+    openAtLogin: systemValue,
+    openAtLoginHydrated: true,
+  });
+  if (result && result.status === "error") {
+    console.warn("Clawd: openAtLogin hydration failed:", result.message);
   }
 }
 
-function savePrefs() {
+// Capture window/mini runtime state into the controller and write to disk.
+// Replaces the legacy `savePrefs()` callsites — they used to read fresh
+// `win.getBounds()` and `_mini.*` at save time, so we mirror that here.
+function flushRuntimeStateToPrefs() {
   if (!win || win.isDestroyed()) return;
-  const { x, y } = win.getBounds();
-  const data = {
-    x, y, size: currentSize,
-    miniMode: _mini.getMiniMode(), miniEdge: _mini.getMiniEdge(), preMiniX: _mini.getPreMiniX(), preMiniY: _mini.getPreMiniY(), lang,
-    showTray, showDock,
-    autoStartWithClaude, bubbleFollowPet, hideBubbles, showSessionId, soundMuted,
-    theme: activeTheme ? activeTheme._id : "clawd",
-  };
-  try { fs.writeFileSync(PREFS_PATH, JSON.stringify(data)); } catch {}
+  const bounds = win.getBounds();
+  _settingsController.applyBulk({
+    x: bounds.x,
+    y: bounds.y,
+    positionSaved: true,
+    size: currentSize,
+    miniMode: _mini.getMiniMode(),
+    miniEdge: _mini.getMiniEdge(),
+    preMiniX: _mini.getPreMiniX(),
+    preMiniY: _mini.getPreMiniY(),
+  });
 }
 
 let _codexMonitor = null;          // Codex CLI JSONL log polling instance
@@ -76,27 +157,24 @@ let _geminiMonitor = null;         // Gemini CLI session JSON polling instance
 const themeLoader = require("./theme-loader");
 themeLoader.init(__dirname, app.getPath("userData"));
 
-function loadThemeFromPrefs(prefs) {
-  return themeLoader.loadTheme((prefs && prefs.theme) || "clawd");
-}
-let activeTheme = loadThemeFromPrefs(loadPrefs());
+let activeTheme = themeLoader.loadTheme(_settingsController.get("theme") || "clawd");
 
 // ── CSS <object> sizing (from theme) ──
 function getObjRect(bounds) {
-  const os = activeTheme.objectScale;
-  return {
-    x: bounds.x + bounds.width * os.offsetX,
-    y: bounds.y + bounds.height * os.offsetY,
-    w: bounds.width * os.widthRatio,
-    h: bounds.height * os.heightRatio,
-  };
+  const state = _state.getCurrentState();
+  const file = _state.getCurrentSvg() || (activeTheme && activeTheme.states && activeTheme.states.idle[0]);
+  return hitGeometry.getAssetRectScreen(activeTheme, bounds, state, file)
+    || { x: bounds.x, y: bounds.y, w: bounds.width, h: bounds.height };
 }
 
 let win;
 let hitWin;  // input window — small opaque rect over hitbox, receives all pointer events
 let tray = null;
 let contextMenuOwner = null;
-let currentSize = "P:10"; // "P:<ratio>" — pet occupies <ratio>% of work area width
+// Mirror of _settingsController.get("size") — initialized from disk, kept in
+// sync by the settings subscriber. The legacy S/M/L → P:N migration runs
+// inside createWindow() because it needs the screen API.
+let currentSize = _settingsController.get("size");
 
 // ── Proportional size mode ──
 // currentSize = "P:<ratio>" means the pet occupies <ratio>% of the work area width.
@@ -118,20 +196,24 @@ function getCurrentPixelSize(overrideWa) {
     const { x, y, width, height } = win.getBounds();
     wa = getNearestWorkArea(x + width / 2, y + height / 2);
   }
-  if (!wa) wa = screen.getPrimaryDisplay().workArea;
+  if (!wa) wa = getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA;
   const px = Math.round(wa.width * ratio / 100);
   return { width: px, height: px };
 }
 let contextMenu;
 let doNotDisturb = false;
 let isQuitting = false;
-let showTray = true;
-let showDock = true;
-let autoStartWithClaude = false;
-let bubbleFollowPet = false;
-let hideBubbles = false;
-let showSessionId = false;
-let soundMuted = false;
+// Mirror caches — kept in sync with the settings store via the subscriber
+// in wireSettingsSubscribers() further down. Read freely; never assign
+// directly (writes go through ctx setters → controller.applyUpdate).
+let showTray = _settingsController.get("showTray");
+let showDock = _settingsController.get("showDock");
+let autoStartWithClaude = _settingsController.get("autoStartWithClaude");
+let openAtLogin = _settingsController.get("openAtLogin");
+let bubbleFollowPet = _settingsController.get("bubbleFollowPet");
+let hideBubbles = _settingsController.get("hideBubbles");
+let showSessionId = _settingsController.get("showSessionId");
+let soundMuted = _settingsController.get("soundMuted");
 let petHidden = false;
 const DEFAULT_TOGGLE_SHORTCUT = "CommandOrControl+Shift+Alt+C";
 
@@ -152,6 +234,7 @@ function togglePetVisibility() {
         if (isLinux) perm.bubble.setSkipTaskbar(true);
       }
     }
+    syncUpdateBubbleVisibility();
     reapplyMacVisibility();
     petHidden = false;
   } else {
@@ -161,6 +244,7 @@ function togglePetVisibility() {
     for (const perm of pendingPermissions) {
       if (perm.bubble && !perm.bubble.isDestroyed()) perm.bubble.hide();
     }
+    hideUpdateBubble();
     petHidden = true;
   }
   syncPermissionShortcuts();
@@ -189,6 +273,52 @@ function sendToHitWin(channel, ...args) {
   if (hitWin && !hitWin.isDestroyed()) hitWin.webContents.send(channel, ...args);
 }
 
+function syncHitStateAfterLoad() {
+  sendToHitWin("hit-state-sync", {
+    currentSvg: _state.getCurrentSvg(),
+    currentState: _state.getCurrentState(),
+    miniMode: _mini.getMiniMode(),
+    dndEnabled: doNotDisturb,
+  });
+}
+
+function syncRendererStateAfterLoad({ includeStartupRecovery = true } = {}) {
+  if (_mini.getMiniMode()) {
+    sendToRenderer("mini-mode-change", true, _mini.getMiniEdge());
+  }
+  if (doNotDisturb) {
+    sendToRenderer("dnd-change", true);
+    if (_mini.getMiniMode()) {
+      applyState("mini-sleep");
+    } else {
+      applyState("sleeping");
+    }
+    return;
+  }
+  if (_mini.getMiniMode()) {
+    applyState("mini-idle");
+    return;
+  }
+  if (sessions.size > 0) {
+    const resolved = resolveDisplayState();
+    applyState(resolved, getSvgOverride(resolved));
+    return;
+  }
+
+  applyState("idle", getSvgOverride("idle"));
+  if (!includeStartupRecovery) return;
+
+  setTimeout(() => {
+    if (sessions.size > 0 || doNotDisturb) return;
+    detectRunningAgentProcesses((found) => {
+      if (found && sessions.size === 0 && !doNotDisturb) {
+        _startStartupRecovery();
+        resetIdleTimer();
+      }
+    });
+  }, 5000);
+}
+
 // ── Sound playback ──
 let lastSoundTime = 0;
 const SOUND_COOLDOWN_MS = 10000;
@@ -201,6 +331,10 @@ function playSound(name) {
   if (!url) return;
   lastSoundTime = now;
   sendToRenderer("play-sound", url);
+}
+
+function resetSoundCooldown() {
+  lastSoundTime = 0;
 }
 
 // Sync input window position to match render window's hitbox.
@@ -228,6 +362,7 @@ let dragLocked = false;
 let menuOpen = false;
 let idlePaused = false;
 let forceEyeResend = false;
+let themeReloadInProgress = false;
 
 // ── Mini Mode — delegated to src/mini.js ──
 // Initialized after state module (needs applyState, resolveDisplayState, etc.)
@@ -238,6 +373,7 @@ let forceEyeResend = false;
 const _permCtx = {
   get win() { return win; },
   get lang() { return lang; },
+  get sessions() { return sessions; },
   get bubbleFollowPet() { return bubbleFollowPet; },
   get permDebugLog() { return permDebugLog; },
   get doNotDisturb() { return doNotDisturb; },
@@ -257,6 +393,31 @@ const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, re
 const pendingPermissions = _perm.pendingPermissions;
 let permDebugLog = null; // set after app.whenReady()
 let updateDebugLog = null; // set after app.whenReady()
+
+const _updateBubbleCtx = {
+  get win() { return win; },
+  get bubbleFollowPet() { return bubbleFollowPet; },
+  get petHidden() { return petHidden; },
+  getPendingPermissions: () => pendingPermissions,
+  getNearestWorkArea,
+  getHitRectScreen,
+  guardAlwaysOnTop,
+  reapplyMacVisibility,
+};
+const _updateBubble = require("./update-bubble")(_updateBubbleCtx);
+const {
+  showUpdateBubble,
+  hideUpdateBubble,
+  repositionUpdateBubble,
+  handleUpdateBubbleAction,
+  handleUpdateBubbleHeight,
+  syncVisibility: syncUpdateBubbleVisibility,
+} = _updateBubble;
+
+function repositionFloatingBubbles() {
+  if (pendingPermissions.length) repositionBubbles();
+  repositionUpdateBubble();
+}
 
 // ── macOS cross-Space visibility helper ──
 // Prefer native collection behavior over Electron's setVisibleOnAllWorkspaces:
@@ -281,6 +442,7 @@ function reapplyMacVisibility() {
   apply(win);
   apply(hitWin);
   for (const perm of pendingPermissions) apply(perm.bubble);
+  apply(_updateBubble.getBubbleWindow());
   apply(contextMenuOwner);
 }
 
@@ -296,6 +458,8 @@ const _stateCtx = {
   get mouseOverPet() { return mouseOverPet; },
   get miniSleepPeeked() { return _mini.getMiniSleepPeeked(); },
   set miniSleepPeeked(v) { _mini.setMiniSleepPeeked(v); },
+  get miniPeeked() { return _mini.getMiniPeeked(); },
+  set miniPeeked(v) { _mini.setMiniPeeked(v); },
   get idlePaused() { return idlePaused; },
   set idlePaused(v) { idlePaused = v; },
   get forceEyeResend() { return forceEyeResend; },
@@ -321,23 +485,24 @@ const { setState, applyState, updateSession, resolveDisplayState, getSvgOverride
         startWakePoll, stopWakePoll, detectRunningAgentProcesses, buildSessionSubmenu,
         startStartupRecovery: _startStartupRecovery } = _state;
 const sessions = _state.sessions;
-const STATE_SVGS = _state.STATE_SVGS;
 const STATE_PRIORITY = _state.STATE_PRIORITY;
 
 // ── Hit-test: SVG bounding box → screen coordinates ──
 function getHitRectScreen(bounds) {
-  const obj = getObjRect(bounds);
-  const vb = activeTheme.viewBox;
-  const scale = Math.min(obj.w, obj.h) / vb.width;
-  const offsetX = obj.x + (obj.w - vb.width * scale) / 2;
-  const offsetY = obj.y + (obj.h - vb.height * scale) / 2;
-  const hb = _state.getCurrentHitBox();
-  return {
-    left:   offsetX + (hb.x + -vb.x) * scale,
-    top:    offsetY + (hb.y + -vb.y) * scale,
-    right:  offsetX + (hb.x + -vb.x + hb.w) * scale,
-    bottom: offsetY + (hb.y + -vb.y + hb.h) * scale,
-  };
+  const state = _state.getCurrentState();
+  const file = _state.getCurrentSvg() || (activeTheme && activeTheme.states && activeTheme.states.idle[0]);
+  const hit = hitGeometry.getHitRectScreen(
+    activeTheme,
+    bounds,
+    state,
+    file,
+    _state.getCurrentHitBox(),
+    {
+      padX: _mini.getMiniMode() ? _mini.PEEK_OFFSET : 0,
+      padY: _mini.getMiniMode() ? 8 : 0,
+    }
+  );
+  return hit || { left: bounds.x, top: bounds.y, right: bounds.x + bounds.width, bottom: bounds.y + bounds.height };
 }
 
 // ── Main tick — delegated to src/tick.js ──
@@ -354,6 +519,8 @@ const _tickCtx = {
   get isAnimating() { return _mini.getIsAnimating(); },
   get miniSleepPeeked() { return _mini.getMiniSleepPeeked(); },
   set miniSleepPeeked(v) { _mini.setMiniSleepPeeked(v); },
+  get miniPeeked() { return _mini.getMiniPeeked(); },
+  set miniPeeked(v) { _mini.setMiniPeeked(v); },
   get mouseOverPet() { return mouseOverPet; },
   set mouseOverPet(v) { mouseOverPet = v; },
   get forceEyeResend() { return forceEyeResend; },
@@ -382,7 +549,7 @@ const _serverCtx = {
   get hideBubbles() { return hideBubbles; },
   get pendingPermissions() { return pendingPermissions; },
   get PASSTHROUGH_TOOLS() { return PASSTHROUGH_TOOLS; },
-  get STATE_SVGS() { return STATE_SVGS; },
+  get STATE_SVGS() { return _state.STATE_SVGS; },
   get sessions() { return sessions; },
   setState,
   updateSession,
@@ -453,6 +620,10 @@ function startTopmostWatchdog() {
     for (const perm of pendingPermissions) {
       if (perm.bubble && !perm.bubble.isDestroyed() && perm.bubble.isVisible()) perm.bubble.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
     }
+    const updateBubbleWin = _updateBubble.getBubbleWindow();
+    if (updateBubbleWin && !updateBubbleWin.isDestroyed() && updateBubbleWin.isVisible()) {
+      updateBubbleWin.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+    }
   }, TOPMOST_WATCHDOG_MS);
 }
 
@@ -467,30 +638,39 @@ function updateLog(msg) {
 }
 
 // ── Menu — delegated to src/menu.js ──
+//
+// Setters that previously assigned to module-level vars now route through
+// `_settingsController.applyUpdate(key, value)`. The mirror cache is updated
+// by the subscriber wired in `wireSettingsSubscribers()` after this ctx is
+// built. Side effects that used to live inside setters (e.g.
+// `syncPermissionShortcuts()` for hideBubbles) are now reactive and live in
+// the subscriber too.
 const _menuCtx = {
   get win() { return win; },
   get sessions() { return sessions; },
   get currentSize() { return currentSize; },
-  set currentSize(v) { currentSize = v; },
+  set currentSize(v) { _settingsController.applyUpdate("size", v); },
   get doNotDisturb() { return doNotDisturb; },
   get lang() { return lang; },
-  set lang(v) { lang = v; },
+  set lang(v) { _settingsController.applyUpdate("lang", v); },
   get showTray() { return showTray; },
-  set showTray(v) { showTray = v; },
+  set showTray(v) { _settingsController.applyUpdate("showTray", v); },
   get showDock() { return showDock; },
-  set showDock(v) { showDock = v; },
+  set showDock(v) { _settingsController.applyUpdate("showDock", v); },
   get autoStartWithClaude() { return autoStartWithClaude; },
-  set autoStartWithClaude(v) { autoStartWithClaude = v; },
+  set autoStartWithClaude(v) { _settingsController.applyUpdate("autoStartWithClaude", v); },
+  get openAtLogin() { return openAtLogin; },
+  set openAtLogin(v) { _settingsController.applyUpdate("openAtLogin", v); },
   get bubbleFollowPet() { return bubbleFollowPet; },
-  set bubbleFollowPet(v) { bubbleFollowPet = v; },
+  set bubbleFollowPet(v) { _settingsController.applyUpdate("bubbleFollowPet", v); },
   get hideBubbles() { return hideBubbles; },
-  set hideBubbles(v) { hideBubbles = v; syncPermissionShortcuts(); },
+  set hideBubbles(v) { _settingsController.applyUpdate("hideBubbles", v); },
   get showSessionId() { return showSessionId; },
-  set showSessionId(v) { showSessionId = v; },
+  set showSessionId(v) { _settingsController.applyUpdate("showSessionId", v); },
   get soundMuted() { return soundMuted; },
-  set soundMuted(v) { soundMuted = v; },
+  set soundMuted(v) { _settingsController.applyUpdate("soundMuted", v); },
   get pendingPermissions() { return pendingPermissions; },
-  repositionBubbles: () => repositionBubbles(),
+  repositionBubbles: () => repositionFloatingBubbles(),
   get petHidden() { return petHidden; },
   togglePetVisibility: () => togglePetVisibility(),
   get isQuitting() { return isQuitting; },
@@ -514,7 +694,11 @@ const _menuCtx = {
   checkForUpdates: (...args) => checkForUpdates(...args),
   getUpdateMenuItem: () => getUpdateMenuItem(),
   buildSessionSubmenu: () => buildSessionSubmenu(),
-  savePrefs,
+  // The settings controller is the only writer of persisted prefs. Toggle
+  // setters above route through it; resize/sendToDisplay use
+  // flushRuntimeStateToPrefs to capture window bounds after movement.
+  flushRuntimeStateToPrefs,
+  settings: _settingsController,
   syncHitWin,
   getCurrentPixelSize,
   isProportionalMode,
@@ -527,62 +711,232 @@ const _menuCtx = {
   discoverThemes: () => themeLoader.discoverThemes(),
   getActiveThemeId: () => activeTheme ? activeTheme._id : "clawd",
   ensureUserThemesDir: () => themeLoader.ensureUserThemesDir(),
+  openSettingsWindow: () => openSettingsWindow(),
 };
 const _menu = require("./menu")(_menuCtx);
 const { t, buildContextMenu, buildTrayMenu, rebuildAllMenus, createTray,
-        showPetContextMenu, popupMenuAt, ensureContextMenuOwner,
-        requestAppQuit, resizeWindow, applyDockVisibility } = _menu;
+        destroyTray, showPetContextMenu, popupMenuAt, ensureContextMenuOwner,
+        requestAppQuit, applyDockVisibility } = _menu;
+
+// ── Settings subscribers ──
+//
+// Single source of truth: any change to `_settingsController` lands here
+// first. We update the mirror caches above (so existing sync read sites
+// still work), then fire reactive side effects (menu rebuild, permission
+// shortcut resync, bubble reposition, etc.). Setters in the ctx above
+// route writes through the controller, so menu clicks and IPC updates
+// from a future settings panel land here identically.
+const MENU_AFFECTING_KEYS = new Set([
+  "lang", "soundMuted", "bubbleFollowPet", "hideBubbles", "showSessionId",
+  "autoStartWithClaude", "openAtLogin", "showTray", "showDock", "theme", "size",
+]);
+function wireSettingsSubscribers() {
+  _settingsController.subscribe(({ changes }) => {
+    // 1. Update mirror caches first so any side-effect handler reads fresh values.
+    if ("lang" in changes) lang = changes.lang;
+    if ("size" in changes) currentSize = changes.size;
+    if ("showTray" in changes) {
+      showTray = changes.showTray;
+      try { changes.showTray ? createTray() : destroyTray(); } catch (err) {
+        console.warn("Clawd: tray toggle failed:", err && err.message);
+      }
+    }
+    if ("showDock" in changes) {
+      showDock = changes.showDock;
+      try { applyDockVisibility(); } catch (err) {
+        console.warn("Clawd: applyDockVisibility failed:", err && err.message);
+      }
+    }
+    // autoStartWithClaude / openAtLogin are object-form pre-commit gates in
+    // settings-actions.js — by the time we get here the system call already
+    // succeeded (or the commit was rejected), so the subscriber only needs
+    // to update the mirror cache. No more registerHooks/setLoginItemSettings
+    // here; that violates the unidirectional flow (see plan §4.2).
+    if ("autoStartWithClaude" in changes) {
+      autoStartWithClaude = changes.autoStartWithClaude;
+    }
+    if ("openAtLogin" in changes) {
+      openAtLogin = changes.openAtLogin;
+    }
+    if ("bubbleFollowPet" in changes) bubbleFollowPet = changes.bubbleFollowPet;
+    if ("hideBubbles" in changes) hideBubbles = changes.hideBubbles;
+    if ("showSessionId" in changes) showSessionId = changes.showSessionId;
+    if ("soundMuted" in changes) soundMuted = changes.soundMuted;
+
+    // 2. Reactive side effects (mirror what the legacy setters / click handlers used to do).
+    if ("hideBubbles" in changes) {
+      try { syncPermissionShortcuts(); } catch (err) {
+        console.warn("Clawd: syncPermissionShortcuts failed:", err && err.message);
+      }
+    }
+    if ("bubbleFollowPet" in changes) {
+      try { repositionFloatingBubbles(); } catch (err) {
+        console.warn("Clawd: repositionFloatingBubbles failed:", err && err.message);
+      }
+    }
+
+    // 3. Menu rebuild — only for menu-affecting keys to avoid thrashing on
+    //    window position / mini state changes.
+    for (const key of Object.keys(changes)) {
+      if (MENU_AFFECTING_KEYS.has(key)) {
+        try { rebuildAllMenus(); } catch (err) {
+          console.warn("Clawd: rebuildAllMenus failed:", err && err.message);
+        }
+        break;
+      }
+    }
+
+    // 4. Broadcast to all renderer windows for the future settings panel.
+    try {
+      for (const bw of BrowserWindow.getAllWindows()) {
+        if (!bw.isDestroyed() && bw.webContents && !bw.webContents.isDestroyed()) {
+          bw.webContents.send("settings-changed", { changes, snapshot: _settingsController.getSnapshot() });
+        }
+      }
+    } catch (err) {
+      console.warn("Clawd: settings-changed broadcast failed:", err && err.message);
+    }
+  });
+}
+wireSettingsSubscribers();
+
+// ── IPC: settings panel write entry points ──
+// Renderer-side callers (the future settings panel) use these. Menu/main code
+// in this process calls _settingsController directly — no IPC round-trip.
+ipcMain.handle("settings:get-snapshot", () => _settingsController.getSnapshot());
+ipcMain.handle("settings:update", (_event, payload) => {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "settings:update payload must be { key, value }" };
+  }
+  return _settingsController.applyUpdate(payload.key, payload.value);
+});
+ipcMain.handle("settings:command", async (_event, payload) => {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "settings:command payload must be { action, payload }" };
+  }
+  return _settingsController.applyCommand(payload.action, payload.payload);
+});
 
 // ── Auto-updater — delegated to src/updater.js ──
 const _updaterCtx = {
   get doNotDisturb() { return doNotDisturb; },
   get miniMode() { return _mini.getMiniMode(); },
+  get lang() { return lang; },
   t, rebuildAllMenus, updateLog,
+  showUpdateBubble: (payload) => showUpdateBubble(payload),
+  hideUpdateBubble: () => hideUpdateBubble(),
+  setUpdateVisualState: (kind) => _state.setUpdateVisualState(kind),
+  applyState: (state, svgOverride) => applyState(state, svgOverride),
+  resolveDisplayState: () => resolveDisplayState(),
+  getSvgOverride: (state) => getSvgOverride(state),
+  resetSoundCooldown: () => resetSoundCooldown(),
 };
 const _updater = require("./updater")(_updaterCtx);
 const { setupAutoUpdater, checkForUpdates, getUpdateMenuItem, getUpdateMenuLabel } = _updater;
 
+// ── Settings panel window ──
+//
+// Single-instance, non-modal, system-titlebar BrowserWindow that hosts the
+// settings UI. Reuses ipcMain.handle("settings:get-snapshot" / "settings:update")
+// already wired up for the controller. The renderer subscribes to
+// settings-changed broadcasts so menu changes and panel changes stay in sync.
+let settingsWindow = null;
+
+function getSettingsWindowIcon() {
+  // Don't pass an icon on macOS — the system uses the .app bundle icon.
+  if (isMac) return undefined;
+  if (isWin) {
+    // Packaged build: extraResources puts icon.ico at process.resourcesPath.
+    // Dev: read it from assets/. The files[] glob in package.json doesn't
+    // include assets/icon.ico, so don't try to load it from __dirname/.. in
+    // a packaged build — that path doesn't exist inside app.asar.
+    return app.isPackaged
+      ? path.join(process.resourcesPath, "icon.ico")
+      : path.join(__dirname, "..", "assets", "icon.ico");
+  }
+  // Linux: build config points at assets/icons/, but those aren't shipped in
+  // files[]. Skip the icon — the .desktop file (deb/AppImage) provides one.
+  return undefined;
+}
+
+function openSettingsWindow() {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    if (settingsWindow.isMinimized()) settingsWindow.restore();
+    settingsWindow.show();
+    settingsWindow.focus();
+    return;
+  }
+  const iconPath = getSettingsWindowIcon();
+  const opts = {
+    width: 800,
+    height: 560,
+    minWidth: 640,
+    minHeight: 480,
+    show: false,
+    frame: true,
+    transparent: false,
+    resizable: true,
+    minimizable: true,
+    maximizable: true,
+    skipTaskbar: false,
+    alwaysOnTop: false,
+    title: "Clawd Settings",
+    backgroundColor: "#f5f5f7",
+    webPreferences: {
+      preload: path.join(__dirname, "preload-settings.js"),
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+  };
+  if (iconPath) opts.icon = iconPath;
+  settingsWindow = new BrowserWindow(opts);
+  settingsWindow.setMenuBarVisibility(false);
+  settingsWindow.loadFile(path.join(__dirname, "settings.html"));
+  settingsWindow.once("ready-to-show", () => {
+    settingsWindow.show();
+    settingsWindow.focus();
+  });
+  settingsWindow.on("closed", () => {
+    settingsWindow = null;
+  });
+}
+
 function createWindow() {
-  const prefs = loadPrefs();
-  if (prefs && isProportionalMode(prefs.size)) {
-    currentSize = prefs.size;
-  } else if (prefs && SIZES[prefs.size]) {
-    // Migrate legacy S/M/L to proportional mode
-    const wa = screen.getPrimaryDisplay().workArea;
+  // Read everything from the settings controller. The mirror caches above
+  // (lang/showTray/etc.) were already initialized at module-load time, so
+  // here we just need the position/mini fields plus the legacy size migration.
+  const prefs = _settingsController.getSnapshot();
+  // Legacy S/M/L → P:N migration. Only kicks in for prefs files that haven't
+  // been touched since v0; new files always store the proportional form.
+  if (SIZES[prefs.size]) {
+    const wa = getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA;
     const px = SIZES[prefs.size].width;
     const ratio = Math.round(px / wa.width * 100);
-    currentSize = `P:${Math.max(1, Math.min(75, ratio))}`;
+    const migrated = `P:${Math.max(1, Math.min(75, ratio))}`;
+    _settingsController.applyUpdate("size", migrated); // subscriber updates currentSize mirror
   }
-  if (prefs && (prefs.lang === "en" || prefs.lang === "zh")) lang = prefs.lang;
-  // macOS: restore tray/dock visibility from prefs
-  if (isMac && prefs) {
-    if (typeof prefs.showTray === "boolean") showTray = prefs.showTray;
-    if (typeof prefs.showDock === "boolean") showDock = prefs.showDock;
-  }
-  if (prefs && typeof prefs.autoStartWithClaude === "boolean") autoStartWithClaude = prefs.autoStartWithClaude;
-  if (prefs && typeof prefs.bubbleFollowPet === "boolean") bubbleFollowPet = prefs.bubbleFollowPet;
-  if (prefs && typeof prefs.hideBubbles === "boolean") hideBubbles = prefs.hideBubbles;
-  if (prefs && typeof prefs.showSessionId === "boolean") showSessionId = prefs.showSessionId;
-  if (prefs && typeof prefs.soundMuted === "boolean") soundMuted = prefs.soundMuted;
-  // macOS: apply dock visibility (default hidden)
+  // macOS: apply dock visibility (default visible — but persisted state wins).
   if (isMac) {
     applyDockVisibility();
   }
   const size = getCurrentPixelSize();
 
-  // Restore saved position, or default to bottom-right of primary display
+  // Restore saved position, or default to bottom-right of primary display.
+  // Prefs file always exists in the new architecture (defaults are hydrated
+  // by prefs.load()), so the "no prefs" branch from the legacy code is gone —
+  // a fresh install gets x=0, y=0 from defaults, and we treat that as "place
+  // bottom-right" via the explicit zero check below.
   let startX, startY;
-  if (prefs && prefs.miniMode) {
-    // Restore mini mode
+  if (prefs.miniMode) {
     const miniPos = _mini.restoreFromPrefs(prefs, size);
     startX = miniPos.x;
     startY = miniPos.y;
-  } else if (prefs) {
+  } else if (prefs.positionSaved) {
     const clamped = clampToScreen(prefs.x, prefs.y, size.width, size.height);
     startX = clamped.x;
     startY = clamped.y;
   } else {
-    const { workArea } = screen.getPrimaryDisplay();
+    const workArea = getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA;
     startX = workArea.x + workArea.width - size.width - 20;
     startY = workArea.y + workArea.height - size.height - 20;
   }
@@ -702,14 +1056,19 @@ function createWindow() {
     if (isWin) guardAlwaysOnTop(hitWin);
 
     // Event-level safety net for position sync
-    win.on("move", syncHitWin);
-    win.on("resize", syncHitWin);
+    const syncFloatingWindows = () => {
+      syncHitWin();
+      if (bubbleFollowPet) repositionFloatingBubbles();
+      else repositionUpdateBubble();
+    };
+    win.on("move", syncFloatingWindows);
+    win.on("resize", syncFloatingWindows);
 
     // Send initial state to hitWin once it's ready
     hitWin.webContents.on("did-finish-load", () => {
-      sendToHitWin("hit-state-sync", {
-        currentSvg: _state.getCurrentSvg(), miniMode: _mini.getMiniMode(), dndEnabled: doNotDisturb,
-      });
+      sendToHitWin("theme-config", themeLoader.getHitRendererConfig());
+      if (themeReloadInProgress) return;
+      syncHitStateAfterLoad();
     });
 
     // Crash recovery for hitWin
@@ -731,7 +1090,7 @@ function createWindow() {
     const looseClamped = looseClampToDisplays(newX, newY, size.width, size.height);
     win.setBounds({ ...looseClamped, width: size.width, height: size.height });
     syncHitWin();
-    if (bubbleFollowPet && pendingPermissions.length) repositionBubbles();
+    if (bubbleFollowPet) repositionFloatingBubbles();
   });
 
   ipcMain.on("pause-cursor-polling", () => { idlePaused = true; });
@@ -764,6 +1123,7 @@ function createWindow() {
         const clamped = clampToScreen(x, y, size.width, size.height);
         win.setBounds({ ...clamped, width: size.width, height: size.height });
         syncHitWin();
+        repositionUpdateBubble();
       }
     }
   });
@@ -793,6 +1153,8 @@ function createWindow() {
 
   ipcMain.on("bubble-height", (event, height) => _perm.handleBubbleHeight(event, height));
   ipcMain.on("permission-decide", (event, behavior) => _perm.handleDecide(event, behavior));
+  ipcMain.on("update-bubble-height", (event, height) => handleUpdateBubbleHeight(event, height));
+  ipcMain.on("update-bubble-action", (event, actionId) => handleUpdateBubbleAction(event, actionId));
 
   initFocusHelper();
   startMainTick();
@@ -802,37 +1164,9 @@ function createWindow() {
   // If hooks arrived during startup, respect them instead of forcing idle
   // Also handles crash recovery (render-process-gone → reload)
   win.webContents.on("did-finish-load", () => {
-    if (_mini.getMiniMode()) {
-      sendToRenderer("mini-mode-change", true, _mini.getMiniEdge());
-    sendToHitWin("hit-state-sync", { miniMode: true });
-    }
-    if (doNotDisturb) {
-      sendToRenderer("dnd-change", true);
-    sendToHitWin("hit-state-sync", { dndEnabled: true });
-      if (_mini.getMiniMode()) {
-        applyState("mini-sleep");
-      } else {
-        applyState("sleeping");
-      }
-    } else if (_mini.getMiniMode()) {
-      applyState("mini-idle");
-    } else if (sessions.size > 0) {
-      const resolved = resolveDisplayState();
-      applyState(resolved, getSvgOverride(resolved));
-    } else {
-      applyState("idle", "clawd-idle-follow.svg");
-      // Startup recovery: delay 5s to let HWND/z-order/drag systems stabilize,
-      // then detect running Claude Code processes → suppress sleep sequence
-      setTimeout(() => {
-        if (sessions.size > 0 || doNotDisturb) return; // hook arrived during wait
-        detectRunningAgentProcesses((found) => {
-          if (found && sessions.size === 0 && !doNotDisturb) {
-            _startStartupRecovery();
-            resetIdleTimer();
-          }
-        });
-      }, 5000);
-    }
+    sendToRenderer("theme-config", themeLoader.getRendererConfig());
+    if (themeReloadInProgress) return;
+    syncRendererStateAfterLoad();
   });
 
   // ── Crash recovery: renderer process can die from <object> churn ──
@@ -862,6 +1196,7 @@ function createWindow() {
     if (isProportionalMode() || clamped.x !== x || clamped.y !== y) {
       win.setBounds({ ...clamped, width: size.width, height: size.height });
       syncHitWin();
+      repositionUpdateBubble();
     }
   });
   screen.on("display-removed", () => {
@@ -876,43 +1211,34 @@ function createWindow() {
     const clamped = clampToScreen(x, y, size.width, size.height);
     win.setBounds({ ...clamped, width: size.width, height: size.height });
     syncHitWin();
+    repositionUpdateBubble();
   });
   screen.on("display-added", () => {
     reapplyMacVisibility();
+    repositionUpdateBubble();
   });
 }
 
-function getNearestWorkArea(cx, cy) {
-  const displays = screen.getAllDisplays();
-  let nearest = displays[0].workArea;
-  let minDist = Infinity;
-  for (const d of displays) {
-    const wa = d.workArea;
-    const dx = Math.max(wa.x - cx, 0, cx - (wa.x + wa.width));
-    const dy = Math.max(wa.y - cy, 0, cy - (wa.y + wa.height));
-    const dist = dx * dx + dy * dy;
-    if (dist < minDist) { minDist = dist; nearest = wa; }
+// Read primary display safely — getPrimaryDisplay() can also throw during
+// display topology changes, so wrap it. Returns null on failure; the pure
+// helpers in work-area.js will fall through to a synthetic last-resort.
+function getPrimaryWorkAreaSafe() {
+  try {
+    const primary = screen.getPrimaryDisplay();
+    return (primary && primary.workArea) || null;
+  } catch {
+    return null;
   }
-  return nearest;
+}
+
+function getNearestWorkArea(cx, cy) {
+  return findNearestWorkArea(screen.getAllDisplays(), getPrimaryWorkAreaSafe(), cx, cy);
 }
 
 // Loose clamp used during drag: union of all display work areas as the boundary,
 // so the pet can freely cross between screens. Only prevents going fully off-screen.
 function looseClampToDisplays(x, y, w, h) {
-  const displays = screen.getAllDisplays();
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const d of displays) {
-    const wa = d.workArea;
-    if (wa.x < minX) minX = wa.x;
-    if (wa.y < minY) minY = wa.y;
-    if (wa.x + wa.width > maxX) maxX = wa.x + wa.width;
-    if (wa.y + wa.height > maxY) maxY = wa.y + wa.height;
-  }
-  const margin = Math.round(w * 0.25);
-  return {
-    x: Math.max(minX - margin, Math.min(x, maxX - w + margin)),
-    y: Math.max(minY - margin, Math.min(y, maxY - h + margin)),
-  };
+  return computeLooseClamp(screen.getAllDisplays(), getPrimaryWorkAreaSafe(), x, y, w, h);
 }
 
 function clampToScreen(x, y, w, h) {
@@ -948,7 +1274,7 @@ const _miniCtx = {
   getNearestWorkArea,
   get bubbleFollowPet() { return bubbleFollowPet; },
   get pendingPermissions() { return pendingPermissions; },
-  repositionBubbles: () => repositionBubbles(),
+  repositionBubbles: () => repositionFloatingBubbles(),
   buildContextMenu: () => buildContextMenu(),
   buildTrayMenu: () => buildTrayMenu(),
 };
@@ -981,34 +1307,34 @@ function switchTheme(themeId) {
 
   // 3. Update active theme
   activeTheme = newTheme;
-
-  const rendererConfig = themeLoader.getRendererConfig();
-  const hitConfig = themeLoader.getHitRendererConfig();
+  _mini.refreshTheme();
+  _state.refreshTheme();
+  _tick.refreshTheme();
+  if (_mini.getMiniMode()) _mini.handleDisplayChange();
 
   // 4. Reload both windows
+  themeReloadInProgress = true;
   win.webContents.reload();
   hitWin.webContents.reload();
 
-  // 5. After reload completes, push new config via IPC + restart tick
+  // 5. After both reloads complete, re-sync state with the new theme.
   let ready = 0;
   const onReady = () => {
     if (++ready < 2) return;
-    // Re-apply current state so renderer shows correct animation
-    const { state, svg } = resolveDisplayState();
-    sendToRenderer("state-change", state, svg);
+    themeReloadInProgress = false;
+    syncHitStateAfterLoad();
+    syncRendererStateAfterLoad({ includeStartupRecovery: false });
     syncHitWin();
     startMainTick();
   };
-  win.webContents.once("did-finish-load", () => {
-    win.webContents.send("theme-config", rendererConfig);
-    onReady();
-  });
-  hitWin.webContents.once("did-finish-load", () => {
-    hitWin.webContents.send("theme-config", hitConfig);
-    onReady();
-  });
+  win.webContents.once("did-finish-load", onReady);
+  hitWin.webContents.once("did-finish-load", onReady);
 
-  savePrefs();
+  // Persist theme choice through the controller so it survives restarts.
+  // flushRuntimeStateToPrefs only captures window bounds + mini state;
+  // user-selected prefs like `theme` must be written explicitly.
+  _settingsController.applyBulk({ theme: themeId });
+  flushRuntimeStateToPrefs();
   rebuildAllMenus();
 }
 
@@ -1079,13 +1405,17 @@ if (!gotTheLock) {
 
   // macOS: hide dock icon early if user previously disabled it
   if (isMac && app.dock) {
-    const prefs = loadPrefs();
-    if (prefs && prefs.showDock === false) {
+    if (_settingsController.get("showDock") === false) {
       app.dock.hide();
     }
   }
 
   app.whenReady().then(() => {
+    // Import system-backed settings (openAtLogin) into prefs on first run.
+    // Must run before createWindow() so the first menu draw sees the
+    // hydrated value rather than the schema default.
+    hydrateSystemBackedSettings();
+
     permDebugLog = path.join(app.getPath("userData"), "permission-debug.log");
     updateDebugLog = path.join(app.getPath("userData"), "update-debug.log");
     createWindow();
@@ -1138,11 +1468,12 @@ if (!gotTheLock) {
 
   app.on("before-quit", () => {
     isQuitting = true;
-    savePrefs();
+    flushRuntimeStateToPrefs();
     unregisterToggleShortcut();
     globalShortcut.unregisterAll();
     _perm.cleanup();
     _server.cleanup();
+    _updateBubble.cleanup();
     _state.cleanup();
     _tick.cleanup();
     _mini.cleanup();
