@@ -133,7 +133,7 @@ const EXCLUDED_KEYS = new Set(["model", "includeMcpJson", "description", "hooks"
 
 function generateClawdTemplateFromBuiltin(options = {}) {
   const homeDir = options.homeDir || os.homedir();
-  const kiroCliCandidates = getKiroCliCandidates(homeDir);
+  const kiroCliCandidates = options.kiroCliCandidates || getKiroCliCandidates(homeDir);
   let lastError = null;
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-kiro-seed-"));
   const tempName = `clawd-seed-${process.pid}-${Date.now()}`;
@@ -181,11 +181,15 @@ function syncClawdAgentFromBuiltin(filePath, options = {}) {
   }
 
   const result = generateClawdTemplateFromBuiltin(options);
+  let desired;
   if (!result.template) {
+    if (!options.silent) {
+      console.warn(`Clawd: kiro-cli template generation failed, falling back to minimal clawd agent (no prompt/tools/resources). Reason: ${result.error?.message || "unknown"}`);
+    }
     desired = {
       name: CLAWD_AGENT_NAME,
       description: "Clawd desktop pet hook integration",
-    }
+    };
   } else {
     desired = { name: CLAWD_AGENT_NAME };
     for (const key of Object.keys(result.template)) {

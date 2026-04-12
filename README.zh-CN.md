@@ -173,6 +173,7 @@ node hooks/install.js
 
 # Kiro CLI - 会将 hooks 注册到 ~/.kiro/agents/ 下所有自定义 agent，
 # 并自动创建一个 clawd agent
+# （仅在已安装 Kiro CLI 时需要执行，未安装时会自动跳过）
 node hooks/kiro-install.js
 
 # Cursor Agent
